@@ -631,6 +631,47 @@ class _TestServerConfig(_TestConfig):
 
         self.assertEqual(config.get('PermitTTY'), True)
 
+    def test_max_startups(self):
+        """Test MaxStartups config option"""
+
+        config = self._parse_config('MaxStartups 10:30:100')
+        self.assertEqual(config.get('MaxStartups'), (10, 30, 100))
+
+        config = self._parse_config('MaxStartups 50')
+        self.assertEqual(config.get('MaxStartups'), (50, None, 50))
+
+        for value in ('xxx', '10:30', 'a:b:c'):
+            with self.subTest(value):
+                with self.assertRaises(asyncssh.ConfigParseError):
+                    self._parse_config(f'MaxStartups {value}')
+
+    def test_per_source_max_startups(self):
+        """Test PerSourceMaxStartups config option"""
+
+        config = self._parse_config('PerSourceMaxStartups 10')
+        self.assertEqual(config.get('PerSourceMaxStartups'), 10)
+
+        config = self._parse_config('PerSourceMaxStartups none')
+        self.assertIsNone(config.get('PerSourceMaxStartups'))
+
+        with self.assertRaises(asyncssh.ConfigParseError):
+            self._parse_config('PerSourceMaxStartups xxx')
+
+    def test_per_source_net_block_size(self):
+        """Test PerSourceNetBlockSize config option"""
+
+        config = self._parse_config('PerSourceNetBlockSize 24:64')
+        self.assertEqual(config.get('PerSourceNetBlockSize'), (24, 64))
+
+        config = self._parse_config('PerSourceNetBlockSize 24')
+        self.assertEqual(config.get('PerSourceNetBlockSize'), (24, 24))
+
+        for value in ('xxx', '1:2:3'):
+            with self.subTest(value):
+                with self.assertRaises(asyncssh.ConfigParseError):
+                    self._parse_config(
+                        f'PerSourceNetBlockSize {value}')
+
 
 del _TestConfig
 
@@ -675,3 +716,52 @@ class _TestOptions(TempDirTestCase):
 
         self.assertEqual(options.keepalive_interval, 1)
         self.assertEqual(options.keepalive_count_max, 3)
+
+    def test_startups_options(self):
+        """Test unauthenticated startup limit server options"""
+
+        # When not configured, no limits are applied
+        options = asyncssh.SSHServerConnectionOptions()
+        self.assertIsNone(options.max_startups)
+        self.assertIsNone(options.per_source_max_startups)
+        self.assertIsNone(options.per_source_net_block_size)
+
+        options = asyncssh.SSHServerConnectionOptions(max_startups=10)
+        self.assertEqual(options.max_startups, (10, None, 10))
+
+        options = asyncssh.SSHServerConnectionOptions(
+            max_startups='10:30:100', per_source_max_startups=5,
+            per_source_net_block_size='24:64')
+        self.assertEqual(options.max_startups, (10, 30, 100))
+        self.assertEqual(options.per_source_max_startups, 5)
+        self.assertEqual(options.per_source_net_block_size, (24, 64))
+
+        # The default source net block sizes are 32 for IPv4 and 128
+        # for IPv6 when a per-source limit is configured.
+        options = asyncssh.SSHServerConnectionOptions(
+            per_source_max_startups=5)
+        self.assertEqual(options.per_source_net_block_size, (32, 128))
+
+        with open('config', 'w') as f:
+            f.write('MaxStartups 10:30:100\n'
+                    'PerSourceMaxStartups 5\n'
+                    'PerSourceNetBlockSize 24:64\n')
+
+        options = asyncssh.SSHServerConnectionOptions(config='config')
+        self.assertEqual(options.max_startups, (10, 30, 100))
+        self.assertEqual(options.per_source_max_startups, 5)
+        self.assertEqual(options.per_source_net_block_size, (24, 64))
+
+        for kwargs in (
+                {'max_startups': 0},
+                {'max_startups': 'xxx'},
+                {'max_startups': '10:30'},
+                {'max_startups': '100:30:10'},
+                {'max_startups': '10:101:100'},
+                {'per_source_max_startups': 0},
+                {'per_source_net_block_size': 33},
+                {'per_source_net_block_size': '32:129'},
+                {'per_source_net_block_size': -1}):
+            with self.subTest(kwargs):
+                with self.assertRaises(ValueError):
+                    asyncssh.SSHServerConnectionOptions(**kwargs)

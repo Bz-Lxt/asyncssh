@@ -3,6 +3,17 @@
 Change Log
 ==========
 
+Release 2.24.2 (under development)
+----------------------------------
+
+* Added support for the OpenSSH-compatible MaxStartups,
+  PerSourceMaxStartups, and PerSourceNetBlockSize configuration
+  options on SSH servers. Inbound connections which have not yet
+  completed authentication can be randomly dropped with an increasing
+  probability and limited per source network, with held slots being
+  released once authentication succeeds or the connection is closed
+  or times out.
+
 Release 2.24.1 (3 Oct 2026)
 ---------------------------
 

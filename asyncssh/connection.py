@@ -101,6 +101,7 @@ from .known_hosts import KnownHostsArg, match_known_hosts
 from .listener import ListenKey, SSHListener
 from .listener import SSHTCPClientListener, SSHUNIXClientListener
 from .listener import TCPListenerFactory, UNIXListenerFactory
+from .listener import _StartupsLimiter, _StartupsReservation
 from .listener import create_tcp_forward_listener, create_unix_forward_listener
 from .listener import create_socks_listener
 
@@ -227,6 +228,8 @@ _PacketHandler = Callable[[SSHPacket], None]
 _AlgsArg = DefTuple[Union[str, Sequence[str]]]
 _AuthArg = DefTuple[bool]
 _AuthKeysArg = DefTuple[Union[None, str, List[str], SSHAuthorizedKeys]]
+_MaxStartupsArg = DefTuple[Union[int, str, Sequence[int]]]
+_NetBlockSizeArg = DefTuple[Union[int, str, Sequence[int]]]
 _ClientHostKey = Union[SSHKeyPair, SSHKeySignKeyPair]
 _ClientKeysArg = Union[KeyListArg, KeyPairListArg]
 _CNAMEArg = DefTuple[Union[Sequence[str], Sequence[Tuple[str, str]]]]
@@ -269,6 +272,10 @@ _DEFAULT_REKEY_SECONDS = 3600       # 1 hour
 
 # Default login timeout
 _DEFAULT_LOGIN_TIMEOUT = 120        # 2 minutes
+
+# Default source network block sizes used by per-source startup limits
+_DEFAULT_IPV4_BLOCK_SIZE = 32
+_DEFAULT_IPV6_BLOCK_SIZE = 128
 
 # Default keepalive interval and count max
 _DEFAULT_KEEPALIVE_INTERVAL = 0     # disabled by default
@@ -632,6 +639,131 @@ def _validate_version(version: DefTuple[BytesOrStr]) -> bytes:
                 raise ValueError('Version string must be printable ASCII')
 
     return version
+
+
+def _validate_max_startups(
+        value: _MaxStartupsArg) -> Optional[Tuple[int, Optional[int], int]]:
+    """Validate the maximum number of unauthenticated startup connections
+
+       The returned tuple is of the form (start, rate, full), where
+       connections begin to be randomly dropped with an increasing
+       probability once `start` unauthenticated connections exist, until
+       all new connections are dropped at `full`. A `rate` of None means
+       that `start` is a hard limit with no random early drop.
+
+    """
+
+    if value in ((), None):
+        return None
+
+    if isinstance(value, bool):
+        raise ValueError('MaxStartups must be a positive value')
+
+    fields: Sequence[Optional[int]]
+
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError('MaxStartups must be a positive value')
+
+        return value, None, value
+    elif isinstance(value, str):
+        try:
+            fields = tuple(int(field) for field in value.split(':'))
+        except ValueError:
+            raise ValueError(
+                f'Invalid MaxStartups value: {value}') from None
+    else:
+        fields = tuple(value)
+
+    if len(fields) == 1:
+        start = full = cast(int, fields[0])
+        rate: Optional[int] = None
+    elif len(fields) == 3:
+        start, rate, full = cast(Tuple[Optional[int], Optional[int],
+                                       Optional[int]], fields)
+    else:
+        raise ValueError('MaxStartups must be a single value or '
+                         'specified as start:rate:full')
+
+    if not isinstance(start, int) or isinstance(start, bool) or start <= 0:
+        raise ValueError('MaxStartups start value must be a positive int')
+
+    if not isinstance(full, int) or isinstance(full, bool) or full <= 0:
+        raise ValueError('MaxStartups full value must be a positive int')
+
+    if start > full:
+        raise ValueError('MaxStartups start value cannot exceed full')
+
+    if rate is not None and (not isinstance(rate, int) or
+                             isinstance(rate, bool) or
+                             not 0 <= rate <= 100):
+        raise ValueError('MaxStartups drop rate must be between 0 and 100')
+
+    return start, rate, full
+
+
+def _validate_per_source_max_startups(
+        value: DefTuple[Optional[int]]) -> Optional[int]:
+    """Validate the per-source maximum number of startup connections"""
+
+    if value in ((), None):
+        return None
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError('PerSourceMaxStartups must be a positive integer')
+
+    return value
+
+
+def _validate_net_block_size(value: _NetBlockSizeArg,
+                              per_source_enabled: bool) -> Optional[Tuple[int,
+                                                                          int]]:
+    """Validate the source network block size for per-source limits"""
+
+    if value in ((), None):
+        return (_DEFAULT_IPV4_BLOCK_SIZE, _DEFAULT_IPV6_BLOCK_SIZE) \
+            if per_source_enabled else None
+
+    fields: Sequence[int]
+
+    if isinstance(value, bool):
+        raise ValueError('PerSourceNetBlockSize must be an integer')
+    elif isinstance(value, int):
+        ipv4_size = ipv6_size = value
+    elif isinstance(value, str):
+        try:
+            fields = tuple(int(field) for field in value.split(':'))
+        except ValueError:
+            raise ValueError(
+                f'Invalid PerSourceNetBlockSize value: {value}') from None
+
+        if len(fields) == 1:
+            ipv4_size = ipv6_size = fields[0]
+        elif len(fields) == 2:
+            ipv4_size, ipv6_size = fields
+        else:
+            raise ValueError('PerSourceNetBlockSize must be a single '
+                             'value or specified as ipv4:ipv6')
+    else:
+        fields = tuple(value)
+
+        if len(fields) == 1:
+            ipv4_size = ipv6_size = fields[0]
+        elif len(fields) == 2:
+            ipv4_size, ipv6_size = fields
+        else:
+            raise ValueError('PerSourceNetBlockSize must be a single '
+                             'value or specified as ipv4:ipv6')
+
+    if not 0 <= ipv4_size <= _DEFAULT_IPV4_BLOCK_SIZE:
+        raise ValueError('IPv4 source net block size must be between '
+                         f'0 and {_DEFAULT_IPV4_BLOCK_SIZE}')
+
+    if not 0 <= ipv6_size <= _DEFAULT_IPV6_BLOCK_SIZE:
+        raise ValueError('IPv6 source net block size must be between '
+                         f'0 and {_DEFAULT_IPV6_BLOCK_SIZE}')
+
+    return ipv4_size, ipv6_size
 
 
 def _expand_algs(alg_type: str, algs: str,
@@ -1419,9 +1551,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         # pylint: disable=broad-except
         try:
-            self._connection_made()
-            self._owner.connection_made(self) # type: ignore
-            self._send_version()
+            if self._connection_made() is not False:
+                self._owner.connection_made(self) # type: ignore
+                self._send_version()
         except Exception:
             self._loop.call_soon(self.internal_error, sys.exc_info())
 
@@ -2104,6 +2236,9 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self.send_userauth_packet(MSG_USERAUTH_REQUEST, packet[1:],
                                   trivial=trivial)
 
+    def _release_startup_slot(self) -> None:
+        """Release unauthenticated connection slots (server only)"""
+
     def send_userauth_failure(self, partial_success: bool) -> None:
         """Send a user authentication failure response"""
 
@@ -2128,6 +2263,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._next_service = None
         self.set_extra_info(username=self._username)
         self._send_deferred_packets()
+
+        self._release_startup_slot()
 
         self._cancel_login_timer()
         self._set_keepalive_timer()
@@ -2220,8 +2357,13 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         else:
             self._report_global_response(False)
 
-    def _connection_made(self) -> None:
-        """Handle the opening of a new connection"""
+    def _connection_made(self) -> bool:
+        """Handle the opening of a new connection
+
+           Return False to abort the connection without completing
+           setup, such as when a server chooses to drop it.
+
+        """
 
         raise NotImplementedError
 
@@ -3527,7 +3669,7 @@ class SSHClientConnection(SSHConnection):
 
         self._dynamic_remote_listeners: Dict[str, SSHTCPClientListener] = {}
 
-    def _connection_made(self) -> None:
+    def _connection_made(self) -> bool:
         """Handle the opening of a new connection"""
 
         assert self._transport is not None
@@ -3610,6 +3752,7 @@ class SSHClientConnection(SSHConnection):
             self.logger.info('  Peer address: %s',
                              (self._peer_addr, self._peer_port))
 
+        return True
 
     def _cleanup(self, exc: Optional[Exception]) -> None:
         """Clean up this client connection"""
@@ -5877,11 +6020,14 @@ class SSHServerConnection(SSHConnection):
                  options: 'SSHServerConnectionOptions',
                  acceptor: _AcceptHandler = None,
                  error_handler: _ErrorHandler = None,
-                 wait: Optional[str] = None):
+                 wait: Optional[str] = None, *,
+                 startups_limiter: Optional[_StartupsLimiter] = None):
         super().__init__(loop, options, acceptor, error_handler,
                          wait, server=True)
 
         self._options = options
+        self._startups_limiter = startups_limiter
+        self._startup_reservation: Optional[_StartupsReservation] = None
 
         self._server_host_keys = options.server_host_keys
         self._all_server_host_keys = options.all_server_host_keys
@@ -5924,8 +6070,22 @@ class SSHServerConnection(SSHConnection):
 
         self._agent_listener: Optional[SSHAgentListener] = None
 
+    def _release_startup_slot(self) -> None:
+        """Release unauthenticated connection slots held by this connection
+
+           Slots are released once authentication succeeds or when the
+           connection is closed or times out while still unauthenticated.
+
+        """
+
+        if self._startup_reservation:
+            self._startup_reservation.release()
+            self._startup_reservation = None
+
     def _cleanup(self, exc: Optional[Exception]) -> None:
         """Clean up this server connection"""
+
+        self._release_startup_slot()
 
         if self._agent_listener:
             self._agent_listener.close()
@@ -5933,7 +6093,7 @@ class SSHServerConnection(SSHConnection):
 
         super()._cleanup(exc)
 
-    def _connection_made(self) -> None:
+    def _connection_made(self) -> bool:
         """Handle the opening of a new connection"""
 
         self.logger.info('Accepted SSH client connection')
@@ -5947,6 +6107,24 @@ class SSHServerConnection(SSHConnection):
                              (self._local_addr, self._local_port))
             self.logger.info('  Peer address: %s',
                              (self._peer_addr, self._peer_port))
+
+        if self._startups_limiter is not None:
+            self._startup_reservation = \
+                self._startups_limiter.admit(self._peer_addr)
+
+            if self._startup_reservation is None:
+                self.logger.info(
+                    'Dropping connection from %s: too many '
+                    'unauthenticated connections',
+                    (self._peer_addr, self._peer_port))
+
+                self._loop.call_soon(
+                    self.connection_lost,
+                    ConnectionLost('Too many unauthenticated connections'))
+
+                return False
+
+        return True
 
     async def reload_config(self) -> None:
         """Re-evaluate config with updated match options"""
@@ -8689,6 +8867,31 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
            The receive window size for sessions on this server
        :param max_pktsize: (optional)
            The maximum packet size for sessions on this server
+       :param max_startups: (optional)
+           The maximum number of unauthenticated connections which may
+           be concurrently accepted by this listener, specified as a
+           single integer or as a string or tuple of the form
+           `'start:rate:full'`. Once the number of unauthenticated
+           connections reaches `start`, new connections begin to be
+           randomly dropped with a probability that increases linearly
+           from 0 to `rate` percent until all new connections are
+           dropped at `full`. A single integer is treated as a hard
+           limit with no random early drop. If not specified, no limit
+           is applied. The held slots are released once a connection
+           successfully authenticates, is closed, or times out.
+       :param per_source_max_startups: (optional)
+           The maximum number of unauthenticated connections allowed
+           concurrently from a single source network, with source
+           addresses grouped using the prefix length specified by
+           `per_source_net_block_size`. If not specified, no per-source
+           limit is applied.
+       :param per_source_net_block_size: (optional)
+           The prefix length in bits used to group source addresses
+           for `per_source_max_startups`, specified as a single integer
+           applied to both IPv4 and IPv6 or as a string or tuple of the
+           form `'ipv4:ipv6'`. This defaults to 32 for IPv4 and 128 for
+           IPv6, grouping by individual host addresses, when a
+           per-source limit is configured.
        :param server_version: (optional)
            An ASCII string to advertise to SSH clients as the version of
            this server, defaulting to `'AsyncSSH'` and its version number.
@@ -8834,6 +9037,9 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
        :type allow_scp: `bool`
        :type window: `int`
        :type max_pktsize: `int`
+       :type max_startups: `int`, `str`, or `tuple`
+       :type per_source_max_startups: `int` or `None`
+       :type per_source_net_block_size: `int`, `str`, or `tuple`
        :type server_version: `str`
        :type kex_algs: `str` or `list` of `str`
        :type encryption_algs: `str` or `list` of `str`
@@ -8889,6 +9095,9 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
     allow_scp: bool
     window: int
     max_pktsize: int
+    max_startups: Optional[Tuple[int, Optional[int], int]]
+    per_source_max_startups: Optional[int]
+    per_source_net_block_size: Optional[Tuple[int, int]]
 
     # pylint: disable=arguments-differ
     def prepare(self, # type: ignore
@@ -8952,7 +9161,10 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
                 sftp_factory: Optional[SFTPServerFactory] = None,
                 sftp_version: int = MIN_SFTP_VERSION,
                 allow_scp: bool = False, window: int = _DEFAULT_WINDOW,
-                max_pktsize: int = _DEFAULT_MAX_PKTSIZE) -> None:
+                max_pktsize: int = _DEFAULT_MAX_PKTSIZE,
+                max_startups: _MaxStartupsArg = (),
+                per_source_max_startups: DefTuple[Optional[int]] = (),
+                per_source_net_block_size: _NetBlockSizeArg = ()) -> None:
         """Prepare server connection configuration options"""
 
         config = SSHServerConfig.load(last_config, config, reload, canonical,
@@ -9084,6 +9296,26 @@ class SSHServerConnectionOptions(SSHConnectionOptions):
         self.allow_scp = allow_scp
         self.window = window
         self.max_pktsize = max_pktsize
+
+        if max_startups == ():
+            max_startups = cast(_MaxStartupsArg, config.get('MaxStartups'))
+
+        self.max_startups = _validate_max_startups(max_startups)
+
+        if per_source_max_startups == ():
+            per_source_max_startups = \
+                cast(Optional[int], config.get('PerSourceMaxStartups'))
+
+        self.per_source_max_startups = \
+            _validate_per_source_max_startups(per_source_max_startups)
+
+        if per_source_net_block_size == ():
+            per_source_net_block_size = \
+                cast(_NetBlockSizeArg, config.get('PerSourceNetBlockSize'))
+
+        self.per_source_net_block_size = _validate_net_block_size(
+            per_source_net_block_size,
+            self.per_source_max_startups is not None)
 
 
 @async_context_manager
@@ -9517,7 +9749,8 @@ async def listen(host = '', port: DefTuple[int] = (), *,
     def conn_factory() -> SSHServerConnection:
         """Return an SSH server connection factory"""
 
-        return SSHServerConnection(loop, new_options, acceptor, error_handler)
+        return SSHServerConnection(loop, new_options, acceptor,
+                                   error_handler, startups_limiter=startups)
 
     loop = asyncio.get_event_loop()
 
@@ -9527,6 +9760,8 @@ async def listen(host = '', port: DefTuple[int] = (), *,
 
     # pylint: disable=attribute-defined-outside-init
     new_options.proxy_command = None
+
+    startups = _StartupsLimiter(new_options)
 
     return await asyncio.wait_for(
         _listen(new_options, config, loop, flags, backlog, sock, reuse_address,

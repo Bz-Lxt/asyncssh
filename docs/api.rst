@@ -1730,7 +1730,10 @@ The following OpenSSH server config options are currently supported:
   | KexAlgorithms
   | LoginGraceTime
   | MACs
+  | MaxStartups
   | PasswordAuthentication
+  | PerSourceMaxStartups
+  | PerSourceNetBlockSize
   | PermitTTY
   | Port
   | ProxyCommand

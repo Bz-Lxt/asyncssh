@@ -22,15 +22,17 @@
 
 import asyncio
 import errno
+import ipaddress
+import random
 import socket
 from types import TracebackType
-from typing import TYPE_CHECKING, AnyStr, Callable, Generic, List, Optional
-from typing import Sequence, Set, Tuple, Type, Union
+from typing import TYPE_CHECKING, AnyStr, Callable, Dict, Generic, List
+from typing import Optional, Sequence, Set, Tuple, Type, Union
 from typing_extensions import Self
 
 from .forward import SSHForwarderCoro
 from .forward import SSHLocalPortForwarder, SSHLocalPathForwarder
-from .misc import HostPort, MaybeAwait
+from .misc import HostPort, IPNetwork, MaybeAwait, ip_address
 from .session import SSHTCPSession, SSHUNIXSession
 from .socks import SSHSOCKSForwarder
 
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
     # pylint: disable=cyclic-import
     from .channel import SSHTCPChannel, SSHUNIXChannel
     from .connection import SSHConnection, SSHClientConnection
+    from .connection import SSHServerConnectionOptions
 
 
 _LocalListenerFactory = Callable[[], asyncio.BaseProtocol]
@@ -47,6 +50,129 @@ ListenKey = Union[HostPort, str]
 
 TCPListenerFactory = Callable[[str, int], MaybeAwait[SSHTCPSession[AnyStr]]]
 UNIXListenerFactory = Callable[[], MaybeAwait[SSHUNIXSession[AnyStr]]]
+
+
+class _StartupsReservation:
+    """Reservation of slots held by one unauthenticated connection"""
+
+    __slots__ = ('_limiter', '_source', '_released')
+
+    def __init__(self, limiter: '_StartupsLimiter',
+                 source: Optional[IPNetwork]) -> None:
+        self._limiter = limiter
+        self._source = source
+        self._released = False
+
+    def release(self) -> None:
+        """Release the reserved slots
+
+           This is idempotent and safe to call both when a connection
+           completes authentication and when it is closed while still
+           unauthenticated.
+
+        """
+
+        if not self._released:
+            self._released = True
+            self._limiter._release(self._source)  # pylint: disable=protected-access
+
+
+class _StartupsLimiter:
+    """Limit unauthenticated connections accepted by a listener
+
+       This implements OpenSSH-compatible MaxStartups random early
+       dropping and per-source netblock startup limits. Limits are
+       read from the listener's options at accept time, so option
+       changes (including via SSHAcceptor.update) apply to newly
+       accepted connections without losing existing counters.
+
+    """
+
+    def __init__(self, options: 'SSHServerConnectionOptions') -> None:
+        self._options = options
+        self._total = 0
+        self._sources: Dict[IPNetwork, int] = {}
+
+    @property
+    def total(self) -> int:
+        """Return the current number of unauthenticated connections"""
+
+        return self._total
+
+    def _get_source(self, peer_addr: str) -> Optional[IPNetwork]:
+        """Return the source netblock a peer address belongs to"""
+
+        per_source_max = self._options.per_source_max_startups
+
+        if not peer_addr or per_source_max is None:
+            return None
+
+        try:
+            addr = ip_address(peer_addr)
+        except ValueError:
+            return None
+
+        block_sizes = self._options.per_source_net_block_size or (32, 128)
+        prefixlen = block_sizes[0] if addr.version == 4 else block_sizes[1]
+
+        return ipaddress.ip_network(f'{str(addr)}/{prefixlen}', strict=False)
+
+    def admit(self, peer_addr: str) -> Optional[_StartupsReservation]:
+        """Try to reserve slots for a new unauthenticated connection
+
+           Returns a reservation to release later if the connection is
+           allowed, or None if it should be dropped before beginning
+           the SSH handshake.
+
+        """
+
+        source = self._get_source(peer_addr)
+        per_source_max = self._options.per_source_max_startups
+
+        if source is not None:
+            assert per_source_max is not None
+
+            source_count = self._sources.get(source, 0)
+
+            if source_count >= per_source_max:
+                return None
+
+        max_startups = self._options.max_startups
+
+        if max_startups is not None:
+            start, rate, full = max_startups
+            count = self._total
+
+            if count >= full:
+                return None
+
+            # Drop probability grows linearly from 0 to rate percent as
+            # the number of unauthenticated connections goes from start
+            # to full.
+            if (rate is not None and count >= start and
+                    random.random() * 100 <
+                    rate * (count - start) / (full - start)):
+                return None
+
+        self._total += 1
+
+        if source is not None:
+            self._sources[source] = source_count + 1
+
+        return _StartupsReservation(self, source)
+
+    def _release(self, source: Optional[IPNetwork]) -> None:
+        """Release slots held by an authenticated or closed connection"""
+
+        self._total -= 1
+
+        if source is not None:
+            count = self._sources[source] - 1
+
+            if count:
+                self._sources[source] = count
+            else:
+                del self._sources[source]
 
 
 class SSHListener:

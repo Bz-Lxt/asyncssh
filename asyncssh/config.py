@@ -392,6 +392,65 @@ class SSHConfig:
         if option not in self._options:
             self._options[option] = byte_limit, time_limit
 
+    def _set_max_startups(self, option: str, args: List[str]) -> None:
+        """Set the maximum number of unauthenticated startup connections"""
+
+        value_str = args.pop(0)
+
+        try:
+            values = [int(value) for value in value_str.split(':')]
+        except ValueError:
+            self._error(f'Invalid {option} value: {value_str}')
+
+        if len(values) == 1:
+            # A single value is a hard limit, with no random early drop
+            value: Tuple[int, Optional[int], int] = \
+                values[0], None, values[0]
+        elif len(values) == 3:
+            value = cast(Tuple[int, Optional[int], int], tuple(values))
+        else:
+            self._error(f'Invalid {option} value: {value_str}')
+
+        if option not in self._options:
+            self._options[option] = value
+
+    def _set_per_source_max_startups(self, option: str,
+                                     args: List[str]) -> None:
+        """Set the maximum startup connections allowed per source netblock"""
+
+        value_str = args.pop(0)
+
+        if value_str.lower() == 'none':
+            value: Optional[int] = None
+        else:
+            try:
+                value = int(value_str)
+            except ValueError:
+                self._error(f'Invalid {option} integer value: {value_str}')
+
+        if option not in self._options:
+            self._options[option] = value
+
+    def _set_net_block_size(self, option: str, args: List[str]) -> None:
+        """Set the source network block size for per-source startup limits"""
+
+        value_str = args.pop(0)
+
+        try:
+            values = [int(value) for value in value_str.split(':')]
+        except ValueError:
+            self._error(f'Invalid {option} value: {value_str}')
+
+        if len(values) == 1:
+            value: Tuple[int, int] = values[0], values[0]
+        elif len(values) == 2:
+            value = cast(Tuple[int, int], tuple(values))
+        else:
+            self._error(f'Invalid {option} value: {value_str}')
+
+        if option not in self._options:
+            self._options[option] = value
+
     def has_match_final(self) -> bool:
         """Return whether this config includes a 'Match final' block"""
 
@@ -774,7 +833,10 @@ class SSHServerConfig(SSHConfig):
         ('KexAlgorithms',                   SSHConfig._set_string),
         ('LoginGraceTime',                  SSHConfig._set_int),
         ('MACs',                            SSHConfig._set_string),
+        ('MaxStartups',                     SSHConfig._set_max_startups),
         ('PasswordAuthentication',          SSHConfig._set_bool),
+        ('PerSourceMaxStartups',            SSHConfig._set_per_source_max_startups),
+        ('PerSourceNetBlockSize',           SSHConfig._set_net_block_size),
         ('PermitTTY',                       SSHConfig._set_bool),
         ('Port',                            SSHConfig._set_int),
         ('PubkeyAuthentication',            SSHConfig._set_bool),

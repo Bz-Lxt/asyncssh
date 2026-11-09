@@ -45,6 +45,7 @@ from asyncssh.crypto.cipher import GCMCipher
 from asyncssh.encryption import get_encryption_algs
 from asyncssh.kex import get_kex_algs
 from asyncssh.kex_dh import MSG_KEX_ECDH_REPLY
+from asyncssh.listener import _StartupsLimiter
 from asyncssh.mac import _HMAC, _mac_handler, get_mac_algs
 from asyncssh.packet import SSHPacket, Boolean, NameList, String, UInt32
 from asyncssh.public_key import get_default_public_key_algs
@@ -2772,6 +2773,299 @@ class _TestListenerContextManager(ServerTestCase):
             async with asyncssh.connect('127.0.0.1', listen_port,
                                         known_hosts=(['skey.pub'], [], [])):
                 pass
+
+
+class _StartupsOptions:
+    """Stand-in for SSHServerConnectionOptions for limiter unit tests"""
+
+    def __init__(self, max_startups=None, per_source_max_startups=None,
+                 per_source_net_block_size=None):
+        self.max_startups = max_startups
+        self.per_source_max_startups = per_source_max_startups
+        self.per_source_net_block_size = per_source_net_block_size
+
+
+class _TestStartupsLimits(ServerTestCase):
+    """Test limits on unauthenticated connections"""
+
+    @classmethod
+    async def start_server(cls):
+        """Defer starting the SSH server to the test"""
+
+    @staticmethod
+    async def _read_startup(reader):
+        """Return the first byte received, or b'' if the connection drops"""
+
+        try:
+            return await reader.read(1)
+        except ConnectionResetError:
+            return b''
+
+    async def _open_unauth(self, port):
+        """Open a raw connection which stays unauthenticated"""
+
+        return await asyncio.open_connection('127.0.0.1', port)
+
+    def test_startups_limiter_disabled(self):
+        """Test a limiter with no configured limits"""
+
+        limiter = _StartupsLimiter(_StartupsOptions())
+
+        slot1 = limiter.admit('10.0.0.1')
+        slot2 = limiter.admit('10.0.0.1')
+        self.assertIsNotNone(slot1)
+        self.assertIsNotNone(slot2)
+        self.assertEqual(limiter.total, 2)
+
+        slot1.release()
+        self.assertEqual(limiter.total, 1)
+        slot1.release()  # releasing again is a no-op
+        self.assertEqual(limiter.total, 1)
+        slot2.release()
+        self.assertEqual(limiter.total, 0)
+
+    def test_startups_hard_limit(self):
+        """Test a hard global startup limit"""
+
+        limiter = _StartupsLimiter(
+            _StartupsOptions(max_startups=(1, None, 1)))
+
+        self.assertIsNotNone(limiter.admit('10.0.0.1'))
+        self.assertIsNone(limiter.admit('10.0.0.2'))
+
+    def test_startups_random_drop(self):
+        """Test random early drop with increasing probability"""
+
+        limiter = _StartupsLimiter(
+            _StartupsOptions(max_startups=(1, 50, 3)))
+
+        slot1 = limiter.admit('10.0.0.1')  # count 0: 0% drop
+        slot2 = limiter.admit('10.0.0.2')  # count 1: 0% drop
+        self.assertIsNotNone(slot1)
+        self.assertIsNotNone(slot2)
+
+        with patch('asyncssh.listener.random.random', return_value=0.99):
+            slot3 = limiter.admit('10.0.0.3')  # count 2: 25% drop
+
+        self.assertIsNotNone(slot3)
+
+        # count 3 == full: connections are always dropped
+        self.assertIsNone(limiter.admit('10.0.0.4'))
+
+        slot3.release()  # back to count 2
+
+        with patch('asyncssh.listener.random.random', return_value=0.0):
+            self.assertIsNone(limiter.admit('10.0.0.5'))
+
+        with patch('asyncssh.listener.random.random', return_value=0.99):
+            self.assertIsNotNone(limiter.admit('10.0.0.6'))
+
+    def test_startups_per_source_limit(self):
+        """Test per-source startup limits"""
+
+        limiter = _StartupsLimiter(_StartupsOptions(
+            per_source_max_startups=2,
+            per_source_net_block_size=(32, 128)))
+
+        slot1 = limiter.admit('10.0.0.1')
+        slot2 = limiter.admit('10.0.0.1')
+        self.assertIsNotNone(slot1)
+        self.assertIsNotNone(slot2)
+        self.assertIsNone(limiter.admit('10.0.0.1'))
+
+        # Other source addresses are not affected
+        slot = limiter.admit('10.0.0.2')
+        self.assertIsNotNone(slot)
+        slot.release()
+
+        # A released per-source slot can be reused
+        slot1.release()
+        self.assertIsNotNone(limiter.admit('10.0.0.1'))
+
+    def test_startups_net_block_size(self):
+        """Test grouping source addresses by net block size"""
+
+        limiter = _StartupsLimiter(_StartupsOptions(
+            per_source_max_startups=1,
+            per_source_net_block_size=(24, 128)))
+
+        self.assertIsNotNone(limiter.admit('10.0.0.1'))
+        self.assertIsNone(limiter.admit('10.0.0.2'))      # same /24
+        self.assertIsNotNone(limiter.admit('10.0.1.1'))
+
+        limiter = _StartupsLimiter(_StartupsOptions(
+            per_source_max_startups=1,
+            per_source_net_block_size=(32, 128)))
+
+        self.assertIsNotNone(limiter.admit('2001:db8::1'))
+        self.assertIsNotNone(limiter.admit('2001:db8::2'))  # distinct /128
+
+        limiter = _StartupsLimiter(_StartupsOptions(
+            per_source_max_startups=1,
+            per_source_net_block_size=(32, 64)))
+
+        self.assertIsNotNone(limiter.admit('2001:db8::1'))
+        self.assertIsNone(limiter.admit('2001:db8::2'))      # same /64
+
+    @asynctest
+    async def test_max_startups(self):
+        """Test dropping connections beyond a hard startup limit"""
+
+        async with self.listen(max_startups=1) as server:
+            port = server.get_port()
+
+            reader1, writer1 = await self._open_unauth(port)
+            self.assertNotEqual(await self._read_startup(reader1), b'')
+
+            reader2, writer2 = await self._open_unauth(port)
+            self.assertEqual(await self._read_startup(reader2), b'')
+
+            writer1.close()
+            writer2.close()
+
+    @asynctest
+    async def test_max_startups_unconfigured(self):
+        """Test connections aren't dropped when no limit is configured"""
+
+        async with self.listen() as server:
+            port = server.get_port()
+
+            conns = []
+
+            try:
+                for _ in range(5):
+                    reader, writer = await self._open_unauth(port)
+                    self.assertNotEqual(
+                        await self._read_startup(reader), b'')
+                    conns.append((reader, writer))
+            finally:
+                for _, writer in conns:
+                    writer.close()
+
+    @asynctest
+    async def test_max_startups_random_drop(self):
+        """Test probabilistic early drop of startup connections"""
+
+        async with self.listen(max_startups='1:50:3') as server:
+            port = server.get_port()
+
+            writers = []
+
+            try:
+                # At count 0 and 1 the drop probability is 0%
+                for _ in range(2):
+                    reader, writer = await self._open_unauth(port)
+                    self.assertNotEqual(
+                        await self._read_startup(reader), b'')
+                    writers.append(writer)
+
+                # At count 2 the drop probability is 25%
+                with patch('asyncssh.listener.random.random',
+                           return_value=0.0):
+                    reader, writer = await self._open_unauth(port)
+                    self.assertEqual(
+                        await self._read_startup(reader), b'')
+                    writer.close()
+
+                with patch('asyncssh.listener.random.random',
+                           return_value=0.99):
+                    reader, writer = await self._open_unauth(port)
+                    self.assertNotEqual(
+                        await self._read_startup(reader), b'')
+                    writers.append(writer)
+            finally:
+                for writer in writers:
+                    writer.close()
+
+    @asynctest
+    async def test_max_startups_release_on_auth(self):
+        """Test startup slots released after authentication"""
+
+        async with self.listen(max_startups=1) as server:
+            port = server.get_port()
+
+            async with self.connect(port=port,
+                                    known_hosts=(['skey.pub'], [], [])):
+                # The authenticated connection no longer holds a slot
+                reader, writer = await self._open_unauth(port)
+                self.assertNotEqual(
+                    await self._read_startup(reader), b'')
+                writer.close()
+
+    @asynctest
+    async def test_max_startups_release_on_disconnect(self):
+        """Test startup slots released on disconnect"""
+
+        closed = asyncio.Event()
+
+        class _TrackingServer(Server):
+            """Server which signals when a connection is closed"""
+
+            def connection_lost(self, exc):
+                """Signal that the connection has been closed"""
+
+                closed.set()
+
+        async with self.listen(server_factory=_TrackingServer,
+                               max_startups=1) as server:
+            port = server.get_port()
+
+            reader, writer = await self._open_unauth(port)
+            self.assertNotEqual(await self._read_startup(reader), b'')
+
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.wait_for(closed.wait(), timeout=5)
+
+            reader2, writer2 = await self._open_unauth(port)
+            self.assertNotEqual(
+                await self._read_startup(reader2), b'')
+            writer2.close()
+
+    @asynctest
+    async def test_max_startups_release_on_login_timeout(self):
+        """Test startup slots released on login timeout"""
+
+        closed = asyncio.Event()
+
+        class _TrackingServer(Server):
+            """Server which signals when a connection is closed"""
+
+            def connection_lost(self, exc):
+                """Signal that the connection has been closed"""
+
+                closed.set()
+
+        async with self.listen(server_factory=_TrackingServer,
+                               max_startups=1, login_timeout=1) as server:
+            port = server.get_port()
+
+            reader, writer = await self._open_unauth(port)
+            self.assertNotEqual(await self._read_startup(reader), b'')
+
+            await asyncio.wait_for(closed.wait(), timeout=5)
+
+            reader2, writer2 = await self._open_unauth(port)
+            self.assertNotEqual(
+                await self._read_startup(reader2), b'')
+            writer.close()
+            writer2.close()
+
+    @asynctest
+    async def test_per_source_max_startups(self):
+        """Test dropping connections beyond a per-source limit"""
+
+        async with self.listen(per_source_max_startups=1) as server:
+            port = server.get_port()
+
+            reader1, writer1 = await self._open_unauth(port)
+            self.assertNotEqual(await self._read_startup(reader1), b'')
+
+            reader2, writer2 = await self._open_unauth(port)
+            self.assertEqual(await self._read_startup(reader2), b'')
+
+            writer1.close()
+            writer2.close()
 
 
 @patch_getaddrinfo
