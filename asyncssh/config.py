@@ -532,7 +532,7 @@ class SSHClientConfig(SSHConfig):
     """Settings from an OpenSSH client config file"""
 
     _conditionals = {'host', 'match'}
-    _no_split = {'proxycommand', 'remotecommand'}
+    _no_split = {'knownhostscommand', 'proxycommand', 'remotecommand'}
     _percent_expand = {'CertificateFile', 'ForwardAgent', 'IdentityAgent',
                        'IdentityFile', 'ProxyCommand', 'RemoteCommand'}
 
@@ -669,6 +669,7 @@ class SSHClientConfig(SSHConfig):
         ('IdentityFile',                    SSHConfig._append_string),
         ('KbdInteractiveAuthentication',    SSHConfig._set_bool),
         ('KexAlgorithms',                   SSHConfig._set_string),
+        ('KnownHostsCommand',               SSHConfig._set_string),
         ('MACs',                            SSHConfig._set_string),
         ('PasswordAuthentication',          SSHConfig._set_bool),
         ('PKCS11Provider',                  SSHConfig._set_string),

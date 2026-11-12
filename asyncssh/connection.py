@@ -36,6 +36,7 @@ import time
 
 from collections import OrderedDict
 from functools import partial
+from hashlib import sha1
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, AnyStr, Awaitable, Callable, Dict
@@ -96,7 +97,8 @@ from .kex import expand_kex_algs, get_kex
 from .keysign import KeySignPath, SSHKeySignKeyPair
 from .keysign import find_keysign, get_keysign_keys
 
-from .known_hosts import KnownHostsArg, match_known_hosts
+from .known_hosts import KnownHostsArg, KnownHostsCommandStage
+from .known_hosts import SSHKnownHostsCommand, match_known_hosts
 
 from .listener import ListenKey, SSHListener
 from .listener import SSHTCPClientListener, SSHUNIXClientListener
@@ -894,6 +896,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._waiter = options.waiter if wait else None
 
         self._transport: Optional[asyncio.Transport] = None
+        self._setup_pending = False
         self._local_addr = ''
         self._local_port = 0
         self._peer_host = ''
@@ -1419,11 +1422,39 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         # pylint: disable=broad-except
         try:
-            self._connection_made()
-            self._owner.connection_made(self) # type: ignore
-            self._send_version()
+            result = self._connection_made()
+
+            if inspect.isawaitable(result):
+                self._setup_pending = True
+                self.create_task(self._connection_made_async(result))
+            else:
+                self._owner.connection_made(self) # type: ignore
+                self._send_version()
         except Exception:
             self._loop.call_soon(self.internal_error, sys.exc_info())
+
+    async def _connection_made_async(self,
+                                     coro: Awaitable[None]) -> None:
+        """Complete asynchronous connection setup before the SSH handshake"""
+
+        try:
+            await coro
+
+            if not self._transport:
+                return
+
+            assert self._owner is not None
+            self._owner.connection_made(self)
+            self._send_version()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.internal_error(sys.exc_info())
+        finally:
+            self._setup_pending = False
+
+            if self._transport:
+                self._recv_data()
 
     def connection_lost(self, exc: Optional[Exception] = None) -> None:
         """Handle the closing of a connection"""
@@ -1457,7 +1488,8 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
         self._inpbuf += data
 
-        self._recv_data()
+        if not self._setup_pending:
+            self._recv_data()
     # pylint: enable=arguments-differ
 
     def eof_received(self) -> None:
@@ -2220,7 +2252,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         else:
             self._report_global_response(False)
 
-    def _connection_made(self) -> None:
+    def _connection_made(self) -> Optional[Awaitable[None]]:
         """Handle the opening of a new connection"""
 
         raise NotImplementedError
@@ -3474,6 +3506,9 @@ class SSHClientConnection(SSHConnection):
         self._known_hosts = options.known_hosts
         self._host_key_alias = options.host_key_alias
 
+        self._known_hosts_command = self._build_known_hosts_command(
+            options.known_hosts_command)
+
         self._server_host_key_algs: Optional[Sequence[bytes]] = None
         self._server_host_key: Optional[SSHKey] = None
 
@@ -3527,7 +3562,87 @@ class SSHClientConnection(SSHConnection):
 
         self._dynamic_remote_listeners: Dict[str, SSHTCPClientListener] = {}
 
-    def _connection_made(self) -> None:
+    def _build_known_hosts_command(
+            self, command: Optional[str]) -> Optional[SSHKnownHostsCommand]:
+        """Build a KnownHostsCommand with the connection token values"""
+
+        if not command:
+            return None
+
+        local_host = socket.gethostname()
+        idx = local_host.find('.')
+        local_host_short = local_host if idx < 0 else local_host[:idx]
+
+        host = self._host
+        port = str(self._port)
+        user = self._username
+
+        conn_hash = sha1(
+            (local_host + host + port + user).encode('utf-8')).hexdigest()
+
+        tokens: Dict[str, str] = {
+            '%': '%',
+            'C': conn_hash,
+            'h': host,
+            'L': local_host_short,
+            'l': local_host,
+            'n': self._options.orig_host,
+            'p': port,
+            'r': user,
+            'u': self._options.client_username,
+            'k': self._host_key_alias or self._options.orig_host,
+            'j': cast(str, self._options.config.get('ProxyJump', '')),
+        }
+
+        home = os.path.expanduser('~')
+
+        if home != '~':
+            tokens['d'] = home
+
+        if hasattr(os, 'getuid'):
+            tokens['i'] = str(os.getuid())
+
+        return SSHKnownHostsCommand(command, tokens)
+
+    @staticmethod
+    def _hostfile_name(name: str, port: Optional[int]) -> str:
+        """Return a known_hosts host name, including a port identifier"""
+
+        return f'[{name}]:{port}' if port else name
+
+    async def _run_known_hosts_command(self, port: Optional[int]) -> None:
+        """Run KnownHostsCommand and merge its output into trusted keys
+
+           The command is executed once for each invocation stage:
+           ORDER output contributes to host key algorithm ordering,
+           HOSTNAME output provides keys for the requested host name,
+           and ADDRESS output provides keys for the server's address.
+           All returned keys are also added to the trusted host keys
+           used by the regular host key verification.
+
+        """
+
+        assert self._known_hosts_command is not None
+
+        host = self._host_key_alias or self._host
+        hostfile_host = self._hostfile_name(host, port)
+
+        known_hosts = await self._known_hosts_command.run(
+            KnownHostsCommandStage.ORDER, hostfile_host)
+        self._match_known_hosts(known_hosts, host, self._peer_addr, port)
+
+        known_hosts = await self._known_hosts_command.run(
+            KnownHostsCommandStage.HOSTNAME, hostfile_host)
+        self._match_known_hosts(known_hosts, host, self._peer_addr, port)
+
+        if self._peer_addr:
+            hostfile_addr = self._hostfile_name(self._peer_addr, port)
+
+            known_hosts = await self._known_hosts_command.run(
+                KnownHostsCommandStage.ADDRESS, hostfile_addr)
+            self._match_known_hosts(known_hosts, '', self._peer_addr, port)
+
+    async def _connection_made(self) -> None:
         """Handle the opening of a new connection"""
 
         assert self._transport is not None
@@ -3571,6 +3686,9 @@ class SSHClientConnection(SSHConnection):
             self._match_known_hosts(cast(KnownHostsArg, self._known_hosts),
                                     self._host_key_alias or self._host,
                                     self._peer_addr, port)
+
+            if self._known_hosts_command:
+                await self._run_known_hosts_command(port)
 
         default_host_key_algs = []
 
@@ -8120,6 +8238,7 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
     client_factory: _ClientFactory
     client_version: bytes
     known_hosts: KnownHostsArg
+    known_hosts_command: Optional[str]
     host_key_alias: Optional[str]
     server_host_key_algs: Union[str, Sequence[str]]
     server_host_keys_handler: _ServerHostKeysHandler
@@ -8313,6 +8432,9 @@ class SSHClientConnectionOptions(SSHConnectionOptions):
         self.host_key_alias = \
             cast(Optional[str], host_key_alias if host_key_alias != () else
                 config.get('HostKeyAlias'))
+
+        self.known_hosts_command = \
+            cast(Optional[str], config.get('KnownHostsCommand'))
 
         self.server_host_key_algs = server_host_key_algs
 

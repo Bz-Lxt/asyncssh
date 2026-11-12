@@ -833,6 +833,102 @@ class _TestConnection(ServerTestCase):
         async with self.connect(known_hosts=known_hosts):
             pass
 
+    def _write_khc_config(self, script, template='%I %H %h %p %t %f %K'):
+        """Write a config file enabling a KnownHostsCommand"""
+
+        with open('khc_empty', 'w'):
+            pass
+
+        with open('config', 'w') as f:
+            f.write('UserKnownHostsFile khc_empty\n')
+            f.write(f'KnownHostsCommand "{sys.executable}" "{script}" '
+                    f'{template}\n')
+
+    @asynctest
+    async def test_known_hosts_command(self):
+        """Test connecting with host keys from a KnownHostsCommand"""
+
+        with open('khc_script.py', 'w') as f:
+            f.write(
+                'import sys\n'
+                'with open("khc_log", "a") as log:\n'
+                '    log.write("|".join(sys.argv[1:]) + "\\n")\n'
+                'with open("skey.pub") as f:\n'
+                '    alg, key = f.read().split()[:2]\n'
+                'sys.stdout.write("127.0.0.1 " + alg + " " + key + "\\n")\n')
+
+        self._write_khc_config(os.path.join(os.getcwd(), 'khc_script.py'))
+
+        rsa_algs = [alg for alg in get_default_public_key_algs()
+                    if b'rsa' in alg]
+
+        async with self.connect(config='config',
+                                x509_trusted_certs=None) as conn:
+            self.assertEqual(conn.get_server_host_key_algs(), rsa_algs)
+            self.assertEqual(conn.get_server_host_key(),
+                             asyncssh.load_public_keys('skey.pub')[0])
+
+        with open('khc_log') as f:
+            calls = [line.strip().split('|') for line in f]
+
+        hostfile_name = f'[{self._server_addr}]:{self._server_port}'
+
+        self.assertEqual([call[0] for call in calls],
+                         ['ORDER', 'HOSTNAME', 'ADDRESS'])
+
+        for call in calls:
+            self.assertEqual(call[1], hostfile_name)
+            self.assertEqual(call[2], self._server_addr)
+            self.assertEqual(call[3], str(self._server_port))
+            self.assertEqual(call[4:7], ['NONE', 'NONE', 'NONE'])
+
+    @asynctest
+    async def test_known_hosts_command_failure(self):
+        """Test that a failing KnownHostsCommand rejects the connection"""
+
+        with open('khc_fail.py', 'w') as f:
+            f.write('import sys\nsys.exit(1)\n')
+
+        self._write_khc_config(os.path.join(os.getcwd(), 'khc_fail.py'),
+                               template='%I')
+
+        with self.assertRaises(ValueError):
+            await self.connect(config='config')
+
+    @asynctest
+    async def test_known_hosts_command_missing(self):
+        """Test a missing KnownHostsCommand executable rejects the connection"""
+
+        with open('khc_empty', 'w'):
+            pass
+
+        with open('config', 'w') as f:
+            f.write('UserKnownHostsFile khc_empty\n')
+            f.write('KnownHostsCommand khc_no_such_executable %I\n')
+
+        with self.assertRaises(ValueError):
+            await self.connect(config='config')
+
+    @asynctest
+    async def test_known_hosts_command_wrong_key(self):
+        """Test an untrusted key from a KnownHostsCommand rejects the host"""
+
+        # ckey.pub holds an RSA key distinct from the server's skey, so
+        # host key algorithms stay compatible but verification still fails
+
+        with open('ckey.pub') as f:
+            bad_line = f.read().strip()
+
+        with open('khc_bad.py', 'w') as f:
+            f.write('import sys\n'
+                    f'sys.stdout.write("127.0.0.1 {bad_line}\\n")\n')
+
+        self._write_khc_config(os.path.join(os.getcwd(), 'khc_bad.py'),
+                               template='%I')
+
+        with self.assertRaises(asyncssh.HostKeyNotVerifiable):
+            await self.connect(config='config')
+
     @asynctest
     async def test_import_known_hosts(self):
         """Test connecting with known hosts object from import_known_hosts"""

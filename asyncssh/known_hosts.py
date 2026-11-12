@@ -24,10 +24,15 @@
 
 """Parser for SSH known_hosts files"""
 
+import asyncio
 import binascii
+from enum import Enum
 from hashlib import sha1
 import hmac
-from typing import Callable, Dict, List, Optional
+import re
+import shlex
+from subprocess import DEVNULL
+from typing import Callable, Dict, List, Mapping, Optional
 from typing import Sequence, Tuple, Union, cast
 
 try:
@@ -60,6 +65,23 @@ _KnownHostsCallable = Callable[[str, str, Optional[int]], Sequence[str]]
 _KnownHostsListArg = Union[str, Sequence[str], 'X509NamePattern']
 KnownHostsArg = Union[None, str, bytes, _KnownHostsCallable, 'SSHKnownHosts',
                       _KnownHostsResult, Sequence[_KnownHostsListArg]]
+
+_khc_token_pattern = re.compile(r'%(.)')
+
+
+class KnownHostsCommandStage(Enum):
+    """The reason for which a ``KnownHostsCommand`` is being executed
+
+       ``ORDER`` is used when preparing the preference list of host key
+       algorithms before a connection is established, ``HOSTNAME`` when
+       looking up host keys for the requested host name, and ``ADDRESS``
+       when looking up host keys matching the server's address.
+
+    """
+
+    ORDER = 'ORDER'
+    HOSTNAME = 'HOSTNAME'
+    ADDRESS = 'ADDRESS'
 
 
 def _load_subject_names(names: Sequence[str]) -> Sequence['X509NamePattern']:
@@ -322,6 +344,124 @@ def read_known_hosts(filelist: Union[str, Sequence[str]]) -> SSHKnownHosts:
         known_hosts.load(read_file(filename, 'r'))
 
     return known_hosts
+
+
+class SSHKnownHostsCommand:
+    """An OpenSSH-style command providing additional known host keys
+
+       This manages the asynchronous execution of a command configured
+       through the ``KnownHostsCommand`` client option. The command may
+       be executed up to three times while establishing a connection,
+       once for each :class:`KnownHostsCommandStage`, and is expected
+       to write host key lines in OpenSSH known_hosts format to its
+       standard output.
+
+       The regular connection tokens are provided when the object is
+       constructed. The following additional tokens are expanded each
+       time the command is run:
+
+           * ``%H`` - the known_hosts host name or address being
+             searched for
+           * ``%I`` - the name of the invocation stage
+           * ``%t`` - the type of the server's host key, or ``NONE``
+           * ``%f`` - the fingerprint of the server's host key, or
+             ``NONE``
+           * ``%K`` - the base64-encoded server host key, or ``NONE``
+
+       A non-zero exit status or any failure to run the command raises
+       a :exc:`ValueError`, causing the connection to be rejected.
+
+    """
+
+    def __init__(self, command: str, tokens: Mapping[str, str]):
+        self._command = command
+        self._tokens = dict(tokens)
+
+    def _expand_command(self, stage: KnownHostsCommandStage,
+                        hostfile_host: str,
+                        key: Optional[SSHKey]) -> str:
+        """Expand the percent tokens in the command template"""
+
+        tokens = dict(self._tokens)
+
+        tokens['H'] = hostfile_host
+        tokens['I'] = stage.value
+
+        if key is None:
+            tokens['t'] = tokens['f'] = tokens['K'] = 'NONE'
+        else:
+            tokens['t'] = key.algorithm.decode('ascii')
+            tokens['f'] = key.get_fingerprint()
+            tokens['K'] = binascii.b2a_base64(
+                key.public_data)[:-1].decode('ascii')
+
+        def expand_token(match: 're.Match[str]') -> str:
+            """Expand a single percent token reference"""
+
+            token = match.group(1)
+
+            try:
+                return tokens[token]
+            except KeyError:
+                raise ValueError('Invalid KnownHostsCommand token: ' +
+                                 match.group(0)) from None
+
+        return _khc_token_pattern.sub(expand_token, self._command)
+
+    async def run(self, stage: KnownHostsCommandStage,
+                  hostfile_host: str,
+                  key: Optional[SSHKey] = None) -> SSHKnownHosts:
+        """Asynchronously run the command and parse its known_hosts output
+
+           :param stage:
+               The invocation stage causing this execution
+           :param hostfile_host:
+               The host name or address being searched for, including
+               a port identifier when a non-default port is in use
+           :param key:
+               The server's host key, or `None` when no key has been
+               offered yet
+           :type stage: :class:`KnownHostsCommandStage`
+           :type hostfile_host: `str`
+           :type key: :class:`SSHKey`
+
+           :returns: An :class:`SSHKnownHosts` object holding the keys
+                     returned by the command
+
+        """
+
+        command = self._expand_command(stage, hostfile_host, key)
+
+        try:
+            args = shlex.split(command, posix=True)
+        except ValueError as exc:
+            raise ValueError(f'KnownHostsCommand "{command}" contains '
+                             f'invalid quotes: {exc}') from None
+
+        if not args:
+            raise ValueError(f'KnownHostsCommand "{self._command}" '
+                             'yielded no arguments')
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdin=DEVNULL, stdout=asyncio.subprocess.PIPE,
+                stderr=DEVNULL)
+
+            stdout, _ = await proc.communicate()
+        except OSError as exc:
+            raise ValueError(f'KnownHostsCommand failed: {exc}') from None
+
+        if proc.returncode != 0:
+            raise ValueError('KnownHostsCommand exited with non-zero '
+                             f'status {proc.returncode}')
+
+        try:
+            data = stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            raise ValueError('KnownHostsCommand returned invalid '
+                             'UTF-8 output') from None
+
+        return SSHKnownHosts(data)
 
 
 def match_known_hosts(known_hosts: KnownHostsArg, host: str,
