@@ -781,6 +781,86 @@ class _TestChannel(ServerTestCase):
                 self.assertFalse(result)
 
     @asynctest
+    async def test_channel_timeout(self):
+        """Test an idle session channel being closed by a channel timeout"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout session=0.5\n')
+
+        try:
+            async with self.connect(username='echo',
+                                    config='config') as conn:
+                chan, _ = await _create_session(conn)
+
+                await asyncio.wait_for(chan.wait_closed(), timeout=3)
+                self.assertTrue(chan.is_closing())
+
+                # The connection remains open and can open new channels
+                chan2, _ = await _create_session(conn)
+                chan2.close()
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_channel_timeout_activity(self):
+        """Test data activity resetting the channel inactivity timeout"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout session=0.5\n')
+
+        try:
+            async with self.connect(username='echo',
+                                    config='config') as conn:
+                chan, _ = await _create_session(conn)
+
+                for _ in range(3):
+                    await asyncio.sleep(0.3)
+                    chan.write('x')
+
+                self.assertFalse(chan.is_closing())
+
+                await asyncio.wait_for(chan.wait_closed(), timeout=3)
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_channel_timeout_zero(self):
+        """Test that a zero channel timeout leaves idle channels open"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout session=0\n')
+
+        try:
+            async with self.connect(username='echo',
+                                    config='config') as conn:
+                chan, _ = await _create_session(conn)
+
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(chan.wait_closed(), timeout=0.5)
+
+                self.assertFalse(chan.is_closing())
+                chan.close()
+                await chan.wait_closed()
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_channel_timeout_unconfigured(self):
+        """Test that idle channels remain open without a channel timeout"""
+
+        async with self.connect(username='echo') as conn:
+            chan, _ = await _create_session(conn)
+
+            self.assertIsNone(conn._channel_timeout_timer)
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(chan.wait_closed(), timeout=0.5)
+
+            self.assertFalse(chan.is_closing())
+            chan.close()
+            await chan.wait_closed()
+
+    @asynctest
     async def test_invalid_open_max_pktsize(self):
         """Test sending an open with invalid max packet size"""
 
@@ -2011,3 +2091,37 @@ class _TestConnectionDropbearServer(ServerTestCase):
             async with self.connect(compression_algs=None) as conn:
                 stdin, _, _ = await conn.open_session()
                 self.assertEqual(stdin.channel.get_send_pktsize(), 32759)
+
+
+class TestChannelTimeoutTypes(unittest.TestCase):
+    """Unit tests for ChannelTimeout channel type name mapping"""
+
+    def test_channel_timeout_types(self):
+        """Test mapping of SSH channel wire types to timeout type names"""
+
+        from asyncssh.channel import _channel_timeout_types
+        from asyncssh.pattern import WildcardPatternList
+
+        expected = {
+            'session': ('session',),
+            'direct-tcpip': ('direct-tcpip',),
+            'forwarded-tcpip': ('forwarded-tcpip',),
+            'direct-streamlocal@openssh.com':
+                ('direct-streamlocal@openssh.com',),
+            'forwarded-streamlocal@openssh.com':
+                ('forwarded-streamlocal@openssh.com',),
+            'x11': ('x11-connection', 'x11'),
+            'auth-agent@openssh.com':
+                ('agent-connection', 'auth-agent@openssh.com'),
+            'tun@openssh.com': ('tun-connection', 'tun@openssh.com')
+        }
+
+        self.assertEqual(set(_channel_timeout_types), set(expected))
+
+        for wire_type, names in expected.items():
+            self.assertEqual(_channel_timeout_types[wire_type], names)
+
+            for name in names:
+                patterns = WildcardPatternList(name)
+                self.assertTrue(any(patterns.matches(type_name)
+                                    for type_name in names))

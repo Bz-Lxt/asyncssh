@@ -984,6 +984,15 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         self._keepalive_interval = options.keepalive_interval
         self._keepalive_timer: Optional[asyncio.TimerHandle] = None
 
+        self._channel_timeouts = \
+            [(WildcardPatternList(pattern), timeout)
+             for pattern, timeout in options.channel_timeouts]
+        self._global_channel_timeout = next(
+            (timeout for pattern, timeout in options.channel_timeouts
+             if pattern == 'global'), 0.0)
+        self._global_channel_activity = 0.0
+        self._channel_timeout_timer: Optional[asyncio.TimerHandle] = None
+
         self._tunnel: Optional[_TunnelProtocol] = None
 
         self._enc_alg_cs = b''
@@ -1087,6 +1096,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Clean up this connection"""
 
         self._cancel_keepalive_timer()
+        self._cancel_channel_timeout_timer()
 
         for chan in list(self._channels.values()):
             chan.process_connection_close(exc)
@@ -1193,6 +1203,94 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         else:
             self._set_keepalive_timer()
             self.create_task(self._make_keepalive_request())
+
+    def _cancel_channel_timeout_timer(self) -> None:
+        """Cancel the channel inactivity timeout timer"""
+
+        if self._channel_timeout_timer:
+            self._channel_timeout_timer.cancel()
+            self._channel_timeout_timer = None
+
+    def _lookup_channel_timeout(self, chan: SSHChannel[AnyStr]) -> float:
+        """Look up the inactivity timeout configured for a channel type"""
+
+        for patterns, timeout in self._channel_timeouts:
+            if any(patterns.matches(name)
+                   for name in chan.get_timeout_types()):
+                return timeout
+
+        return 0.0
+
+    def _set_channel_timeout_timer(self) -> None:
+        """Set the channel inactivity timeout timer to the earliest expiry"""
+
+        if not self._channel_timeouts:
+            return
+
+        now = time.monotonic()
+        earliest: Optional[float] = None
+
+        for chan in self._channels.values():
+            expiry = chan._get_idle_expiry(now)
+
+            if expiry is not None and (earliest is None or
+                                       expiry < earliest):
+                earliest = expiry
+
+        self._cancel_channel_timeout_timer()
+
+        if earliest is not None:
+            self._channel_timeout_timer = self._loop.call_later(
+                max(0.0, earliest - now),
+                self._channel_timeout_timer_callback)
+
+    def _channel_opened(self, chan: SSHChannel[AnyStr]) -> None:
+        """Start inactivity timeout tracking on a newly opened channel"""
+
+        if not self._channel_timeouts:
+            return
+
+        now = time.monotonic()
+
+        chan._idle_timeout = self._lookup_channel_timeout(chan)
+        chan._last_activity = now
+
+        if self._global_channel_timeout:
+            self._global_channel_activity = now
+
+        self._set_channel_timeout_timer()
+
+    def _channel_activity(self, chan: SSHChannel[AnyStr]) -> None:
+        """Record data activity on a channel, resetting inactivity timers"""
+
+        if not self._channel_timeouts:
+            return
+
+        now = time.monotonic()
+
+        chan._last_activity = now
+
+        if self._global_channel_timeout:
+            self._global_channel_activity = now
+
+        self._set_channel_timeout_timer()
+
+    def _channel_timeout_timer_callback(self) -> None:
+        """Close channels which have been inactive for too long"""
+
+        self._channel_timeout_timer = None
+
+        now = time.monotonic()
+
+        for chan in list(self._channels.values()):
+            expiry = chan._get_idle_expiry(now)
+
+            if expiry is not None and now >= expiry:
+                self.logger.info('Closing channel %s after inactivity '
+                                 'timeout', chan._recv_chan)
+                chan.abort()
+
+        self._set_channel_timeout_timer()
 
     def _force_close(self, exc: Optional[Exception]) -> None:
         """Force this connection to close immediately"""
@@ -1495,6 +1593,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
         """Remove the channel with the specified channel number"""
 
         del self._channels[recv_chan]
+        self._set_channel_timeout_timer()
 
     def get_gss_context(self) -> GSSBase:
         """Return the GSS context associated with this connection"""
@@ -2775,6 +2874,7 @@ class SSHConnection(SSHPacketHandler, asyncio.Protocol):
 
             if callable(handler):
                 chan, session = handler(packet)
+                chan.set_chantype(chantype)
                 chan.process_open(send_chan, send_window,
                                   send_pktsize, session)
             else:
@@ -7395,6 +7495,7 @@ class SSHConnectionOptions(Options, Generic[_Options]):
     login_timeout: float
     keepalive_internal: float
     keepalive_count_max: int
+    channel_timeouts: Sequence[Tuple[str, float]]
 
     def __init__(self, options: Optional[_Options] = None, **kwargs: object):
         last_config = options.config if options else None
@@ -7607,6 +7708,10 @@ class SSHConnectionOptions(Options, Generic[_Options]):
         self.login_timeout = login_timeout
         self.keepalive_interval = keepalive_interval
         self.keepalive_count_max = keepalive_count_max
+
+        self.channel_timeouts = cast(
+            Sequence[Tuple[str, float]],
+            config.get('ChannelTimeout', ()))
 
 
 class SSHClientConnectionOptions(SSHConnectionOptions):

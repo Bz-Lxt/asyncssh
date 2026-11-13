@@ -550,6 +550,104 @@ class _TestTCPForwarding(_CheckForwarding):
             await self._check_connection(conn)
 
     @asynctest
+    async def test_connection_channel_timeout(self):
+        """Test a channel timeout closing an idle direct-tcpip channel"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout direct-tcpip=0.5\n')
+
+        try:
+            async with self.connect(config='config') as conn:
+                reader, _ = await conn.open_connection('', 7)
+
+                await asyncio.wait_for(reader.channel.wait_closed(),
+                                       timeout=3)
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_connection_channel_timeout_mismatch(self):
+        """Test that another channel type's timeout doesn't apply"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout session=0.5\n')
+
+        try:
+            async with self.connect(config='config') as conn:
+                reader, writer = await conn.open_connection('', 7)
+
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(reader.channel.wait_closed(),
+                                           timeout=1.0)
+
+                writer.close()
+                await writer.wait_closed()
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_connection_channel_timeout_wildcard(self):
+        """Test a wildcard channel type in a channel timeout rule"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout *tcpip*=0.5\n')
+
+        try:
+            async with self.connect(config='config') as conn:
+                reader, _ = await conn.open_connection('', 7)
+
+                await asyncio.wait_for(reader.channel.wait_closed(),
+                                       timeout=3)
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_connection_channel_timeout_global(self):
+        """Test a global channel timeout closing all idle channels"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout global=0.5\n')
+
+        try:
+            async with self.connect(config='config') as conn:
+                reader1, _ = await conn.open_connection('', 7)
+                reader2, _ = await conn.open_connection('', 7)
+
+                await asyncio.wait_for(reader1.channel.wait_closed(),
+                                       timeout=3)
+                await asyncio.wait_for(reader2.channel.wait_closed(),
+                                       timeout=3)
+        finally:
+            os.remove('config')
+
+    @asynctest
+    async def test_connection_channel_timeout_global_activity(self):
+        """Test activity on one channel resetting the global timeout"""
+
+        with open('config', 'w') as f:
+            f.write('ChannelTimeout global=0.5\n')
+
+        try:
+            async with self.connect(config='config') as conn:
+                reader1, writer1 = await conn.open_connection('', 7)
+                reader2, _ = await conn.open_connection('', 7)
+
+                for _ in range(3):
+                    await asyncio.sleep(0.3)
+                    writer1.write(b'x')
+                    await reader1.read(1)
+
+                self.assertFalse(reader1.channel.is_closing())
+                self.assertFalse(reader2.channel.is_closing())
+
+                await asyncio.wait_for(reader1.channel.wait_closed(),
+                                       timeout=3)
+                await asyncio.wait_for(reader2.channel.wait_closed(),
+                                       timeout=3)
+        finally:
+            os.remove('config')
+
+    @asynctest
     async def test_connection_failure(self):
         """Test failure in opening a remote connection"""
 

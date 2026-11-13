@@ -82,6 +82,23 @@ _signal_names = {v: k for (k, v) in _signal_numbers.items()}
 _ExitSignal = Tuple[str, bool, str, str]
 _RequestHandler = Optional[Callable[[SSHPacket], Optional[bool]]]
 
+# Mapping from SSH channel wire types to the channel type names matched
+# by ChannelTimeout rules, following OpenSSH's channel classification.
+_channel_timeout_types: Dict[str, Tuple[str, ...]] = {
+    'session':                              ('session',),
+    'direct-tcpip':                         ('direct-tcpip',),
+    'forwarded-tcpip':                      ('forwarded-tcpip',),
+    'direct-streamlocal@openssh.com':
+        ('direct-streamlocal@openssh.com',),
+    'forwarded-streamlocal@openssh.com':
+        ('forwarded-streamlocal@openssh.com',),
+    'x11':                                  ('x11-connection', 'x11'),
+    'auth-agent@openssh.com':
+        ('agent-connection', 'auth-agent@openssh.com'),
+    'tun@openssh.com':                      ('tun-connection',
+                                             'tun@openssh.com')
+}
+
 
 class SSHChannel(Generic[AnyStr], SSHPacketHandler):
     """Parent class for SSH channels"""
@@ -143,6 +160,10 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._request_waiters: List[asyncio.Future[bool]] = []
 
         self._close_event = asyncio.Event()
+
+        self._chantype: Optional[str] = None
+        self._idle_timeout = 0.0
+        self._last_activity = 0.0
 
         self._recv_chan: Optional[int] = conn.add_channel(self)
 
@@ -411,6 +432,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         else:
             self._deliver_data(data, datatype)
 
+        self._channel_activity()
+
     def _service_next_request(self) -> None:
         """Process next item on channel request queue"""
 
@@ -455,6 +478,54 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
         self._send_state = 'closed'
         self._close_send()
         self._cleanup(exc)
+
+    def set_chantype(self, chantype: str) -> None:
+        """Set the channel type on channels opened by a remote request"""
+
+        self._chantype = chantype
+
+    def get_timeout_types(self) -> Tuple[str, ...]:
+        """Return the channel type names used to match inactivity timeouts"""
+
+        if self._chantype is None:
+            return ()
+        else:
+            return _channel_timeout_types.get(
+                self._chantype, (self._chantype,))
+
+    def _get_idle_expiry(self, now: float) -> Optional[float]:
+        """Return the time at which this channel expires from inactivity"""
+
+        conn = self._conn
+
+        if conn is None or self._last_activity == 0.0:
+            return None
+
+        expiry: Optional[float] = None
+
+        if self._idle_timeout:
+            expiry = self._last_activity + self._idle_timeout
+
+        if conn._global_channel_timeout:
+            global_expiry = (conn._global_channel_activity +
+                             conn._global_channel_timeout)
+
+            if expiry is None or global_expiry < expiry:
+                expiry = global_expiry
+
+        return expiry
+
+    def _channel_opened(self) -> None:
+        """Notify the connection that this channel is now open"""
+
+        assert self._conn is not None
+        self._conn._channel_opened(self)
+
+    def _channel_activity(self) -> None:
+        """Notify the connection of bidirectional data activity"""
+
+        if self._conn is not None:
+            self._conn._channel_activity(self)
 
     def process_open(self, send_chan: int, send_window: int, send_pktsize: int,
                      session: MaybeAwait[SSHSession[AnyStr]]) -> None:
@@ -508,6 +579,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._recv_state = 'open'
 
             self._session.connection_made(chan)
+            self._channel_opened()
         except ChannelOpenError as exc:
             if self._conn:
                 assert self._send_chan is not None
@@ -537,6 +609,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
             self._open_waiter.set_result(packet)
 
         self._open_waiter = None
+
+        self._channel_opened()
 
     def process_open_failure(self, code: int, reason: str, lang: str) -> None:
         """Process a channel open failure"""
@@ -700,6 +774,8 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         if self._send_state != 'closed':
             raise OSError('Channel already open')
+
+        self._chantype = chantype.decode('ascii')
 
         self._open_waiter = self._loop.create_future()
 
@@ -947,6 +1023,7 @@ class SSHChannel(Generic[AnyStr], SSHPacketHandler):
 
         self._send_buf.append((bytearray(encoded_data), datatype))
         self._send_buf_len += datalen
+        self._channel_activity()
         self._flush_send_buf()
 
     def writelines(self, list_of_data: Iterable[AnyStr],

@@ -330,6 +330,26 @@ class _TestClientConfig(_TestConfig):
                                     'UserKnownHostsFile file2')
         self.assertEqual(config.get('UserKnownHostsFile'), [])
 
+    def test_set_channel_timeout(self):
+        """Test channel timeout config option"""
+
+        config = self._parse_config(
+            'ChannelTimeout session=30s global=5m\n'
+            'ChannelTimeout x11-connection=10 direct-tcpip=0')
+
+        self.assertEqual(config.get('ChannelTimeout'),
+                         [('session', 30.0), ('global', 300.0),
+                          ('x11-connection', 10.0), ('direct-tcpip', 0.0)])
+
+        for desc, config_data in (
+                ('Missing interval', 'ChannelTimeout session'),
+                ('Missing type', 'ChannelTimeout =10'),
+                ('Invalid interval', 'ChannelTimeout session=abc'),
+                ('Negative interval', 'ChannelTimeout session=-5')):
+            with self.subTest(desc):
+                with self.assertRaises(asyncssh.ConfigParseError):
+                    self._parse_config(config_data)
+
     def test_append_string_list(self):
         """Test appending multiple string config options to a list"""
 

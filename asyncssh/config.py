@@ -35,6 +35,7 @@ from typing import Sequence, Set, Tuple, Union, cast
 from .constants import DEFAULT_PORT
 from .logging import logger
 from .misc import DefTuple, FilePath, IllegalUserName, ip_address
+from .misc import parse_time_interval
 from .pattern import HostPatternList, WildcardPatternList
 
 try:
@@ -604,6 +605,31 @@ class SSHClientConfig(SSHConfig):
         if option not in self._options:
             self._options[option] = value
 
+    def _set_channel_timeout(self, option: str, args: List[str]) -> None:
+        """Set channel inactivity timeout config option"""
+
+        timeouts = cast(List[Tuple[str, float]],
+                        self._options.get(option, []))
+
+        for arg in args:
+            chantype, sep, interval = arg.partition('=')
+
+            if not sep or not chantype:
+                self._error(f'Invalid {option} value: {arg}')
+
+            try:
+                seconds = parse_time_interval(interval)
+            except ValueError:
+                self._error(f'Invalid {option} time interval: {interval}')
+
+            if seconds < 0:
+                self._error(f'Invalid {option} time interval: {interval}')
+
+            timeouts.append((chantype, seconds))
+
+        args.clear()
+        self._options[option] = timeouts
+
     def _set_tokens(self) -> None:
         """Set the tokens available for percent expansion"""
 
@@ -650,6 +676,7 @@ class SSHClientConfig(SSHConfig):
         ('CASignatureAlgorithms',           SSHConfig._set_string),
         ('CertificateFile',                 SSHConfig._append_string),
         ('ChallengeResponseAuthentication', SSHConfig._set_bool),
+        ('ChannelTimeout',                  _set_channel_timeout),
         ('Ciphers',                         SSHConfig._set_string),
         ('Compression',                     SSHConfig._set_bool),
         ('ConnectTimeout',                  SSHConfig._set_int),
